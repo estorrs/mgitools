@@ -1,0 +1,8 @@
+*.pyc
+*.egg-info/
+*.DS_Store
+
+*.log
+*.output
+
+test.sh
