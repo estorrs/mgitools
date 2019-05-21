@@ -71,3 +71,27 @@ def test_bsub_hello_world_multiple_commands():
         f = open(log_fp)
         assert 'Successfully completed' in f.read()
         f.close()
+
+def test_bsub_hello_world_with_pipe():
+    command = 'echo "hello, world!" | egrep "hello, world"'
+
+    bsub_script_fp = 'test.sh'
+    bsub.generate_bsub_bash_script([command], 'python:3.6-jessie', bsub_script_fp)
+
+    result = subprocess.check_output(['bash', bsub_script_fp]).decode('utf-8')
+
+    assert 'is submitted to queue' in result
+
+    job_id = re.sub(r'^.*<([0-9]*)>.*$', r'\1', result).replace('\n', '')
+
+    # wait for setup
+    time.sleep(5)
+
+    while True:
+        bjob_output = subprocess.check_output(['bjobs']).decode('utf-8')
+        if job_id not in bjob_output:
+            break
+        time.sleep(5)
+
+    f = open(DEFAULT_LOG_FP)
+    assert 'Successfully completed' in f.read()
