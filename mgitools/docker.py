@@ -7,7 +7,7 @@ import sys
 import time
 import uuid
 
-logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
+CONTAINER_ID_LENGTH = 7
 
 def remap_command(command, container_prefix='/inputs'):
     new_command = []
@@ -36,7 +36,6 @@ def remap_command(command, container_prefix='/inputs'):
             new_command.append(container_fp)
         else:
             new_command.append(piece)
-
 
     return ' '.join(new_command), volume_map
 
@@ -72,11 +71,37 @@ def get_running_container_ids():
 
     container_ids = set()
     for line in lines:
-        c_id = re.split(r'\s+', line.strip())[0]
+        c_id = re.split(r'\s+', line.strip())[0][:CONTAINER_ID_LENGTH]
         if c_id:
             container_ids.add(c_id)
 
     return container_ids
+
+def execute_command(command, image, max_memory=2, log_fp=None, wait_time=10):
+    waiting = set()
+
+    docker_command = generate_docker_command(command, image, max_memory=max_memory,
+            return_list=True)
+    logging.debug(f'docker command: {docker_command}')
+    container_id = subprocess.check_output(docker_command).decode('utf-8').strip()
+    container_id = container_id[:CONTAINER_ID_LENGTH]
+    logging.info(f'container id: {container_id} is executing: {command}')
+    waiting.add(container_id)
+
+    logging.info(f'currently waiting for: {waiting}')
+    while waiting:
+        running_container_ids = get_running_container_ids()
+        finished = waiting.difference(running_container_ids)
+        waiting = waiting - finished
+        time.sleep(wait_time)
+
+    logging.info('gathering container logs')
+    container_logs = subprocess.run(('docker', 'logs', container_id), stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE).stderr.decode('utf-8')
+    f = open(log_fp, 'w')
+    f.write(container_logs)
+    f.close()
+    logging.info('job successfully completed')
 
 def execute_commands(commands, image, max_memory=2, batch_size=10, logs_dir=os.getcwd(),
         wait_time=100):
@@ -89,35 +114,37 @@ def execute_commands(commands, image, max_memory=2, batch_size=10, logs_dir=os.g
             logging.info(f'containers currently running: {running_container_ids}')
             time.sleep(wait_time)
         else:
-            command = commands.pop()
+            command = commands.pop(0)
             docker_command = generate_docker_command(command, image, max_memory=max_memory,
                     return_list=True)
 
             try:
                 container_id = subprocess.check_output(docker_command).decode('utf-8').strip()
+                container_id = container_id[:CONTAINER_ID_LENGTH]
+                logging.info(f'container id: {container_id} is executing: {command}')
+                waiting.add(container_id)
+
+                log_fp = os.path.join(logs_dir, f'{container_id}.log')
+                logs_to_container_ids[log_fp] = container_id
             except subprocess.CalledProcessError:
-                logging.warning(f'command failed: {command}')
+                logging.exception(f'command failed: {command}')
 
-            logging.info(f'container id: {container_id} is executing: {command}')
-            waiting.add(container_id)
-
-            log_fp = os.path.join(logs_dir, f'{container_id}.log')
-            logs_to_container_ids[log_fp] = container_id
 
         running_container_ids = get_running_container_ids()
         logging.debug(f'running containers: {running_container_ids}')
         finished = waiting.difference(running_container_ids)
-        waiting = running_container_ids - finished
+        waiting = waiting - finished
         logging.debug(f'currently waiting for: {waiting}')
 
     while waiting:
         running_container_ids = get_running_container_ids()
-        logging.info(f'running containers: {running_container_ids}')
-        finished = waiting.difference(running_container_ids)
-        waiting = running_container_ids - finished
+        logging.debug(f'running containers: {running_container_ids}')
         logging.info(f'currently waiting for: {waiting}')
+        finished = waiting.difference(running_container_ids)
+        waiting = waiting - finished
         time.sleep(wait_time)
 
+    logging.info('gathering container logs')
     for log_fp, container_id in logs_to_container_ids.items():
         try:
             container_logs = subprocess.run(('docker', 'logs', container_id), stdout=subprocess.DEVNULL,
@@ -128,34 +155,59 @@ def execute_commands(commands, image, max_memory=2, batch_size=10, logs_dir=os.g
         except subprocess.CalledProcessError:
             logging.warning(f'failed to get logs for container: {container_id}')
 
+    logging.info('jobs finished')
 
-    logging.info('jobs complete')
+def check_arguments(args):
+    if args.commands_file is None and args.command is None:
+        raise ValueError('Either a commands file or a command must be specified. \
+Provide either --command or --commands-file')
+    if args.commands_file is not None and args.command is not None:
+        raise ValueError('Command file and command cannot both be specified. \
+Provide either --command or --commands-file')
 
 if __name__ == '__main__':
+
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('commands_file', type=str,
+    parser.add_argument('--commands-file', type=str,
             help='File with commands to execute. One command per line.')
+    parser.add_argument('--command', type=str,
+            help='Command to execute')
     parser.add_argument('image', type=str,
             help='Image to run commands in')
     parser.add_argument('--logs-dir', type=str, default=os.getcwd(),
             help='Directory to store logs in.')
+    parser.add_argument('--log-file', type=str, default='job.log',
+            help='Filepath to store job logs at.')
     parser.add_argument('--max-memory', type=int, default=1,
             help='Max memory (in Gb) per job. Must be an integer.')
     parser.add_argument('--batch-size', type=int, default=10,
             help='Max number of jobs to execute at one time.')
+    parser.add_argument('--verbose', action='store_true',
+            help='Set logging level to debug for verbose output')
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.DEBUG)
+    else:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+    check_arguments(args)
 
     # make log directory
     if not os.path.isdir(args.logs_dir):
         os.mkdir(args.logs_dir)
 
-    f = open(args.commands_file)
-    commands = []
-    for line in f:
-        commands.append(line.strip())
-    f.close()
+    if args.commands_file is not None:
+        f = open(args.commands_file)
+        commands = []
+        for line in f:
+            commands.append(line.strip())
+        f.close()
 
-    execute_commands(commands, args.image, max_memory=args.max_memory, batch_size=args.batch_size,
-            logs_dir=args.logs_dir, wait_time=100)
+        execute_commands(commands, args.image, max_memory=args.max_memory, batch_size=args.batch_size,
+                logs_dir=args.logs_dir, wait_time=100)
+    else:
+        execute_command(args.command, args.image, max_memory=args.max_memory, log_fp=args.log_file,
+                wait_time=10)
